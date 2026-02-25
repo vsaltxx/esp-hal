@@ -1,0 +1,158 @@
+const REMINDER_MARKER = "<!-- assigned-reminder-bot -->";
+const INACTIVITY_DAYS = 45;
+const COOLDOWN_DAYS = 7;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const COMMENT_TEMPLATE = `{marker}
+
+Dear {mentions},
+
+This is a gentle reminder that it has been {days} days since the last update on this issue.
+Please review the issue and provide any updates or progress in the comments.
+
+Thank you.`;
+
+async function run({ github, context, core, dryRun }) {
+  const owner = context.repo.owner;
+  const repo = context.repo.repo;
+  const now = Date.now();
+  const inactivityMs = INACTIVITY_DAYS * MS_PER_DAY;
+  const cooldownMs = COOLDOWN_DAYS * MS_PER_DAY;
+
+  let totalChecked = 0;
+  let totalReminders = 0;
+  let totalSkipped = 0;
+
+  core.info(`Starting assignee-reminder (dryRun=${dryRun})`);
+  core.info(`Inactivity threshold: ${INACTIVITY_DAYS} days`);
+  core.info(`Cooldown threshold: ${COOLDOWN_DAYS} days`);
+
+  for await (const { data: issues } of github.paginate.iterator(
+    github.rest.issues.listForRepo,
+    {   
+        owner, 
+        repo, 
+        state: "open", 
+        assignee: "*", 
+        per_page: 100,
+    },
+  )) {
+    for (const issue of issues) {
+      if (issue.pull_request) continue;
+
+      totalChecked++;
+
+      const result = await processIssue({
+        github,
+        owner,
+        repo,
+        issue,
+        now,
+        inactivityMs,
+        cooldownMs,
+        dryRun,
+        core,
+      });
+
+      if (result.skipped) totalSkipped++;
+      if (result.reminded) totalReminders++;
+    }
+  }
+
+  core.info("--- Summary ---");
+  core.info(`Total issues checked: ${totalChecked}`);
+  core.info(`Total reminders sent: ${totalReminders}`);
+  core.info(`Total skipped (cooldown): ${totalSkipped}`);
+}
+
+async function processIssue({
+  github,
+  owner,
+  repo,
+  issue,
+  now,
+  inactivityMs,
+  cooldownMs,
+  dryRun,
+  core,
+}) {
+  const assignees = issue.assignees.map((a) => a.login);
+  const assigneeSet = new Set(assignees.map((a) => a.toLowerCase()));
+
+  const activityByAssignee = {};
+  let hasRecentReminder = false;
+
+  for await (const { data: comments } of github.paginate.iterator(
+    github.rest.issues.listComments,
+    { owner, repo, issue_number: issue.number, per_page: 100 },
+  )) {
+    for (const comment of comments) {
+      const login = comment.user?.login?.toLowerCase();
+      if (login && assigneeSet.has(login)) {
+        const t = new Date(comment.created_at).getTime();
+        activityByAssignee[login] = Math.max(activityByAssignee[login] || 0, t);
+      }
+      if (comment.body?.includes(REMINDER_MARKER)) {
+        const t = new Date(comment.created_at).getTime();
+        if (t >= now - cooldownMs) hasRecentReminder = true;
+      }
+    }
+  }
+
+  for await (const { data: events } of github.paginate.iterator(
+    github.rest.issues.listEvents,
+    { owner, repo, issue_number: issue.number, per_page: 100 },
+  )) {
+    for (const event of events) {
+      if (event.event === "assigned" && event.assignee) {
+        const login = event.assignee.login.toLowerCase();
+        if (assigneeSet.has(login)) {
+          const t = new Date(event.created_at).getTime();
+          activityByAssignee[login] = Math.max(activityByAssignee[login] || 0, t);
+        }
+      }
+    }
+  }
+
+  const issueCreatedAt = new Date(issue.created_at).getTime();
+  const lastActivity = Math.max(
+    ...Object.values(activityByAssignee),
+    issueCreatedAt,
+  );
+  const inactivityDurationMs = now - lastActivity;
+
+  if (inactivityDurationMs < inactivityMs) return { reminded: false, skipped: false };
+
+  const mentions = assignees.map((a) => `@${a}`).join(", ");
+
+  if (hasRecentReminder) {
+    core.info(
+      `#${issue.number}: Skipped ${mentions} (reminder already posted within ${COOLDOWN_DAYS} days)`,
+    );
+    return { reminded: false, skipped: true };
+  }
+
+  const days = Math.floor(inactivityDurationMs / MS_PER_DAY);
+  if (dryRun) {
+    core.info(
+      `[DRY RUN] #${issue.number}: Would remind ${mentions} (inactive for ${days} days)`,
+    );
+    return { reminded: true, skipped: false };
+  }
+
+  const body = COMMENT_TEMPLATE
+    .replace("{marker}", REMINDER_MARKER)
+    .replace("{mentions}", mentions)
+    .replace("{days}", days);
+
+  await github.rest.issues.createComment({
+    owner,
+    repo,
+    issue_number: issue.number,
+    body,
+  });
+
+  core.info(`#${issue.number}: Reminder sent to ${mentions} (inactive for ${days} days)`);
+  return { reminded: true, skipped: false };
+}
+
+module.exports = { run };
