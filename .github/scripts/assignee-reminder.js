@@ -1,6 +1,6 @@
 const REMINDER_MARKER = "<!-- assigned-reminder-bot -->";
-const INACTIVITY_DAYS = 45;
-const COOLDOWN_DAYS = 7;
+const INACTIVITY_DAYS = 2; // test scenario only
+const COOLDOWN_DAYS = 1;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const COMMENT_TEMPLATE = `{marker}
 
